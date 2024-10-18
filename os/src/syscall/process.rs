@@ -1,4 +1,5 @@
 //! Process management syscalls
+<<<<<<< HEAD
 use alloc::sync::Arc;
 
 use crate::{
@@ -7,8 +8,17 @@ use crate::{
     mm::{translated_refmut, translated_str},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
+=======
+
+use crate::{
+    config::MAX_SYSCALL_NUM,
+    mm::translated_byte_buffer,
+    task::{
+        change_program_brk, current_user_token, exit_current_and_run_next,
+>>>>>>> a4e6d4d (re-implement get_current_time)
         suspend_current_and_run_next, TaskStatus,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -117,12 +127,40 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel: sys_get_time");
+    let us = get_time_us();
+    let buffers = translated_byte_buffer(
+        current_user_token(),
+        ts as *const u8,
+        core::mem::size_of::<TimeVal>(),
     );
-    -1
+
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+
+    unsafe {
+        let mut writed_bytes = 0;
+        for buffer in buffers {
+            let time_val_bytes = core::slice::from_raw_parts(
+                &time_val as *const _ as *const u8,
+                core::mem::size_of::<TimeVal>(),
+            );
+            let len = buffer.len().min(time_val_bytes.len() - writed_bytes);
+            buffer[..len].copy_from_slice(&time_val_bytes[writed_bytes..writed_bytes + len]);
+            writed_bytes += len;
+            if writed_bytes >= time_val_bytes.len() {
+                break;
+            }
+        }
+        if writed_bytes == core::mem::size_of::<TimeVal>() {
+            0
+        } else {
+            -1
+        }
+    }
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
