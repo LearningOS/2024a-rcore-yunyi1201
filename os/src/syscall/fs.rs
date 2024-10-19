@@ -2,13 +2,15 @@
 use crate::mm::translated_byte_buffer;
 use crate::sbi::console_getchar;
 use crate::task::{current_task, current_user_token, suspend_current_and_run_next};
+use crate::syscall::SYSCALL_WRITE;
 
 const FD_STDIN: usize = 0;
 const FD_STDOUT: usize = 1;
 
 /// write buf of length `len`  to a file with `fd`
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
-    trace!("kernel:pid[{}] sys_write", current_task().unwrap().pid.0);
+    trace!("kernel: sys_write");
+    record_syscall(SYSCALL_WRITE);
     match fd {
         FD_STDOUT => {
             let buffers = translated_byte_buffer(current_user_token(), buf, len);

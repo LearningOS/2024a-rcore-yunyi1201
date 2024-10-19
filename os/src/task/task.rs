@@ -43,6 +43,11 @@ pub struct TaskControlBlockInner {
     /// Application data can only appear in areas
     /// where the application address space is lower than base_size
     pub base_size: usize,
+    /// syscall invoke times
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
+    /// time that first scheduled
+    pub first_scheduled: Option<usize>,
 
     /// Save task context
     pub task_cx: TaskContext,
@@ -110,6 +115,8 @@ impl TaskControlBlock {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
                     base_size: user_sp,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    first_scheduled: None,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
                     memory_set,
@@ -182,6 +189,8 @@ impl TaskControlBlock {
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
+                    first_scheduled: None,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,

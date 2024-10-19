@@ -1,23 +1,16 @@
 //! Process management syscalls
-<<<<<<< HEAD
 use alloc::sync::Arc;
 
 use crate::{
     config::MAX_SYSCALL_NUM,
     loader::get_app_data_by_name,
+    mm::{copy_to_user, translated_byte_buffer},
     mm::{translated_refmut, translated_str},
-    task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-=======
-
-use crate::{
-    config::MAX_SYSCALL_NUM,
-    mm::translated_byte_buffer,
-    task::{
-        change_program_brk, current_user_token, exit_current_and_run_next,
->>>>>>> a4e6d4d (re-implement get_current_time)
-        suspend_current_and_run_next, TaskStatus,
+    syscall::{
+        SYSCALL_EXIT, SYSCALL_GET_TIME, SYSCALL_MMAP, SYSCALL_MUNMAP, SYSCALL_TASK_INFO,
+        SYSCALL_YIELD,
     },
+    task::{add_task, current_task, current_user_token, exit_current_and_run_next},
     timer::get_time_us,
 };
 
@@ -32,23 +25,33 @@ pub struct TimeVal {
 #[allow(dead_code)]
 pub struct TaskInfo {
     /// Task status in it's life cycle
-    status: TaskStatus,
+    pub status: TaskStatus,
     /// The numbers of syscall called by task
-    syscall_times: [u32; MAX_SYSCALL_NUM],
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
     /// Total running time of task
-    time: usize,
+    pub time: usize,
+}
+
+impl TaskInfo {
+    fn new() -> Self {
+        TaskInfo {
+            status: TaskStatus::UnInit,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        }
+    }
 }
 
 /// task exits and submit an exit code
-pub fn sys_exit(exit_code: i32) -> ! {
-    trace!("kernel:pid[{}] sys_exit", current_task().unwrap().pid.0);
-    exit_current_and_run_next(exit_code);
+pub fn sys_exit(_exit_code: i32) -> ! {
+    trace!("kernel: sys_exit");
+    exit_current_and_run_next();
     panic!("Unreachable in sys_exit!");
 }
 
 /// current task gives up resources for other tasks
 pub fn sys_yield() -> isize {
-    trace!("kernel:pid[{}] sys_yield", current_task().unwrap().pid.0);
+    trace!("kernel: sys_yield");
     suspend_current_and_run_next();
     0
 }
@@ -89,7 +92,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -129,6 +136,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
+    record_syscall(SYSCALL_GET_TIME);
     let us = get_time_us();
     let buffers = translated_byte_buffer(
         current_user_token(),
@@ -140,26 +148,14 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
         sec: us / 1_000_000,
         usec: us % 1_000_000,
     };
-
     unsafe {
-        let mut writed_bytes = 0;
-        for buffer in buffers {
-            let time_val_bytes = core::slice::from_raw_parts(
+        copy_to_user(
+            buffers,
+            core::slice::from_raw_parts(
                 &time_val as *const _ as *const u8,
                 core::mem::size_of::<TimeVal>(),
-            );
-            let len = buffer.len().min(time_val_bytes.len() - writed_bytes);
-            buffer[..len].copy_from_slice(&time_val_bytes[writed_bytes..writed_bytes + len]);
-            writed_bytes += len;
-            if writed_bytes >= time_val_bytes.len() {
-                break;
-            }
-        }
-        if writed_bytes == core::mem::size_of::<TimeVal>() {
-            0
-        } else {
-            -1
-        }
+            ),
+        )
     }
 }
 
@@ -167,28 +163,19 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
 pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_task_info NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
+    trace!("kernel: sys_task_info NOT IMPLEMENTED YET!");
     -1
 }
 
-/// YOUR JOB: Implement mmap.
+// YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
+    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
     -1
 }
 
-/// YOUR JOB: Implement munmap.
+// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
+    trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
     -1
 }
 
