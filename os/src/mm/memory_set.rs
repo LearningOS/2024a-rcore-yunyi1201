@@ -262,6 +262,30 @@ impl MemorySet {
             false
         }
     }
+
+    /// check if the vpn is mapped
+    #[allow(unused)]
+    pub fn is_mapped(&self, vpn: VirtPageNum) -> bool {
+        self.areas.iter().any(|area| {
+            area.vpn_range.get_start() <= vpn
+                && vpn < area.vpn_range.get_end()
+                && area.data_frames.contains_key(&vpn)
+        })
+    }
+
+    /// unmap an continuous area
+    pub fn unmap_area(&mut self, start: usize, end: usize) {
+        let mut current = start;
+        while current < end {
+            let start_vpn = VirtAddr::from(current).floor();
+            if let Some(area) = self.areas.iter_mut().find(|area| {
+                start_vpn >= area.vpn_range.get_start() && start_vpn < area.vpn_range.get_end()
+            }) {
+                area.unmap_one(&mut self.page_table, start_vpn);
+            }
+            current += crate::config::PAGE_SIZE;
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -376,6 +400,22 @@ bitflags! {
         const X = 1 << 3;
         ///Accessible in U mode
         const U = 1 << 4;
+    }
+}
+
+impl From<usize> for MapPermission {
+    fn from(perm: usize) -> Self {
+        let mut map_perm = MapPermission::empty();
+        if perm & 1 != 0 {
+            map_perm |= MapPermission::R;
+        }
+        if perm & 2 != 0 {
+            map_perm |= MapPermission::W;
+        }
+        if perm & 4 != 0 {
+            map_perm |= MapPermission::X;
+        }
+        map_perm
     }
 }
 

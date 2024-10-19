@@ -15,7 +15,10 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MapPermission;
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
+use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -79,6 +82,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        next_task.first_scheduled = Some(get_time_ms());
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -140,6 +144,9 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            if inner.tasks[next].first_scheduled.is_none() {
+                inner.tasks[next].first_scheduled = Some(get_time_ms());
+            }
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -152,6 +159,48 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+    /// record syscall
+    fn record_syscall(&self, syscall_number: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_number] += 1;
+    }
+
+    /// get take info
+    fn get_current_task_info(&self, info: &mut TaskInfo) {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        *info = TaskInfo {
+            status: TaskStatus::Running,
+            syscall_times: inner.tasks[cur].syscall_times,
+            time: get_time_ms() - inner.tasks[cur].first_scheduled.unwrap(),
+        }
+    }
+
+    /// check virtual page is maped in current task
+    fn is_mapped(&self, va: crate::mm::VirtAddr) -> bool {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.is_mapped(va.into())
+    }
+
+    /// map area structure, controls a contiguous piece of virtual memory
+    fn map_area(&self, start: usize, end: usize, permission: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.insert_framed_area(
+            start.into(),
+            end.into(),
+            MapPermission::from(permission) | MapPermission::U,
+        );
+    }
+
+    /// unmap area structure, controls a contiguous piece of virtual memory
+    fn unmap_area(&self, start: usize, end: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.unmap_area(start, end);
     }
 }
 
@@ -201,4 +250,29 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// record syscall invoke
+pub fn record_syscall(syscall_number: usize) {
+    TASK_MANAGER.record_syscall(syscall_number);
+}
+
+/// get current task infomation
+pub fn get_current_task_info(info: &mut TaskInfo) {
+    TASK_MANAGER.get_current_task_info(info);
+}
+
+/// check virtual page is maped in current task
+pub fn is_mapped(va: crate::mm::VirtAddr) -> bool {
+    TASK_MANAGER.is_mapped(va)
+}
+
+/// map a contiguous piece of virtual memory in current task
+pub fn map_area(start: usize, end: usize, permission: usize) {
+    TASK_MANAGER.map_area(start, end, permission);
+}
+
+/// unmap a contiguous piece of virtual memory in current task
+pub fn unmap_area(start: usize, end: usize) {
+    TASK_MANAGER.unmap_area(start, end);
 }

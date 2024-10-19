@@ -2,10 +2,14 @@
 
 use crate::{
     config::MAX_SYSCALL_NUM,
-    mm::translated_byte_buffer,
+    mm::{copy_to_user, translated_byte_buffer},
+    syscall::{
+        SYSCALL_EXIT, SYSCALL_GET_TIME, SYSCALL_MMAP, SYSCALL_MUNMAP, SYSCALL_TASK_INFO,
+        SYSCALL_YIELD,
+    },
     task::{
-        change_program_brk, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next, TaskStatus,
+        change_program_brk, current_user_token, exit_current_and_run_next, get_current_task_info,
+        is_mapped, map_area, record_syscall, suspend_current_and_run_next, unmap_area, TaskStatus,
     },
     timer::get_time_us,
 };
@@ -21,16 +25,27 @@ pub struct TimeVal {
 #[allow(dead_code)]
 pub struct TaskInfo {
     /// Task status in it's life cycle
-    status: TaskStatus,
+    pub status: TaskStatus,
     /// The numbers of syscall called by task
-    syscall_times: [u32; MAX_SYSCALL_NUM],
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
     /// Total running time of task
-    time: usize,
+    pub time: usize,
+}
+
+impl TaskInfo {
+    fn new() -> Self {
+        TaskInfo {
+            status: TaskStatus::UnInit,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        }
+    }
 }
 
 /// task exits and submit an exit code
 pub fn sys_exit(_exit_code: i32) -> ! {
     trace!("kernel: sys_exit");
+    record_syscall(SYSCALL_EXIT);
     exit_current_and_run_next();
     panic!("Unreachable in sys_exit!");
 }
@@ -38,6 +53,7 @@ pub fn sys_exit(_exit_code: i32) -> ! {
 /// current task gives up resources for other tasks
 pub fn sys_yield() -> isize {
     trace!("kernel: sys_yield");
+    record_syscall(SYSCALL_YIELD);
     suspend_current_and_run_next();
     0
 }
@@ -47,6 +63,7 @@ pub fn sys_yield() -> isize {
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
+    record_syscall(SYSCALL_GET_TIME);
     let us = get_time_us();
     let buffers = translated_byte_buffer(
         current_user_token(),
@@ -58,47 +75,95 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
         sec: us / 1_000_000,
         usec: us % 1_000_000,
     };
-
     unsafe {
-        let mut writed_bytes = 0;
-        for buffer in buffers {
-            let time_val_bytes = core::slice::from_raw_parts(
+        copy_to_user(
+            buffers,
+            core::slice::from_raw_parts(
                 &time_val as *const _ as *const u8,
                 core::mem::size_of::<TimeVal>(),
-            );
-            let len = buffer.len().min(time_val_bytes.len() - writed_bytes);
-            buffer[..len].copy_from_slice(&time_val_bytes[writed_bytes..writed_bytes + len]);
-            writed_bytes += len;
-            if writed_bytes >= time_val_bytes.len() {
-                break;
-            }
-        }
-        if writed_bytes == core::mem::size_of::<TimeVal>() {
-            0
-        } else {
-            -1
-        }
+            ),
+        )
     }
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
-pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
+pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
     trace!("kernel: sys_task_info NOT IMPLEMENTED YET!");
-    -1
+    record_syscall(SYSCALL_TASK_INFO);
+
+    let buffers = translated_byte_buffer(
+        current_user_token(),
+        ti as *const u8,
+        core::mem::size_of::<TaskInfo>(),
+    );
+    let mut task_info = TaskInfo::new();
+    get_current_task_info(&mut task_info);
+
+    unsafe {
+        copy_to_user(
+            buffers,
+            core::slice::from_raw_parts(
+                &task_info as *const _ as *const u8,
+                core::mem::size_of::<TaskInfo>(),
+            ),
+        )
+    }
 }
 
 // YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    -1
+    record_syscall(SYSCALL_MMAP);
+    // if 'start' is not page aligned, return -1
+    if start % crate::config::PAGE_SIZE != 0 {
+        return -1;
+    }
+    // port is not valid, return -1
+    if port & !0x7 != 0 || port & 0x7 == 0 {
+        return -1;
+    }
+
+    if len == 0 {
+        return 0;
+    }
+
+    // align len to page size
+    let len = (len + crate::config::PAGE_SIZE - 1) & !(crate::config::PAGE_SIZE - 1);
+
+    assert!(len % crate::config::PAGE_SIZE == 0);
+
+    let mut current = start;
+    while current < start + len {
+        if is_mapped(current.into()) {
+            return -1;
+        }
+        current += crate::config::PAGE_SIZE;
+    }
+    map_area(start, start + len, port);
+    0
 }
 
 // YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    -1
+    record_syscall(SYSCALL_MUNMAP);
+    if (start % crate::config::PAGE_SIZE) != 0 {
+        return -1;
+    }
+
+    let len = (len + crate::config::PAGE_SIZE - 1) & (!(crate::config::PAGE_SIZE - 1));
+
+    let mut current = start;
+    while current < start + len {
+        if !is_mapped(current.into()) {
+            return -1;
+        }
+        current += crate::config::PAGE_SIZE;
+    }
+    unmap_area(start, start + len);
+    0
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
