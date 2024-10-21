@@ -274,16 +274,47 @@ impl MemorySet {
     }
 
     /// unmap an continuous area
+    /// require that start is page-aligned
     pub fn unmap_area(&mut self, start: usize, end: usize) {
-        let mut current = start;
-        while current < end {
-            let start_vpn = VirtAddr::from(current).floor();
-            if let Some(area) = self.areas.iter_mut().find(|area| {
-                start_vpn >= area.vpn_range.get_start() && start_vpn < area.vpn_range.get_end()
-            }) {
-                area.unmap_one(&mut self.page_table, start_vpn);
+        assert!(start % PAGE_SIZE == 0);
+        let mut start_va: VirtAddr = start.into();
+        while start_va < end.into() {
+            let area = self.areas.iter_mut().enumerate().find(|(_, area)| {
+                area.vpn_range.get_start() <= start_va.into()
+                    && area.vpn_range.get_end() > start_va.into()
+            });
+            if let Some((index, area)) = area {
+                let end_va: VirtAddr = end.into();
+                if area.vpn_range.get_end() <= end_va.into()
+                    && area.vpn_range.get_start() == start_va.into()
+                {
+                    let old_end = area.vpn_range.get_end();
+                    area.unmap(&mut self.page_table);
+                    self.areas.remove(index);
+                    start_va = old_end.into();
+                } else if area.vpn_range.get_start() < start_va.into()
+                    && area.vpn_range.get_end() == end_va.into()
+                {
+                    area.shrink_to(&mut self.page_table, start_va.into());
+                    break;
+                } else if area.vpn_range.get_start() == start_va.into()
+                    && area.vpn_range.get_end() > end_va.into()
+                {
+                    for vpn in VPNRange::new(start_va.into(), end_va.into()) {
+                        area.unmap_one(&mut self.page_table, vpn);
+                    }
+                    area.vpn_range = VPNRange::new(end_va.into(), area.vpn_range.get_end());
+                    break;
+                } else {
+                    // split the area
+                    for vpn in VPNRange::new(start_va.into(), end_va.into()) {
+                        area.unmap_one(&mut self.page_table, vpn);
+                    }
+                    let split_area = area.split(end_va.into(), start_va.into());
+                    self.areas.push(split_area);
+                    break;
+                }
             }
-            current += crate::config::PAGE_SIZE;
         }
     }
 }
@@ -357,6 +388,19 @@ impl MapArea {
             self.map_one(page_table, vpn)
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+
+    /// split the area
+    #[allow(unused)]
+    pub fn split(&mut self, split_vpn: VirtPageNum, new_end: VirtPageNum) -> Self {
+        let new_area = Self {
+            vpn_range: VPNRange::new(split_vpn, self.vpn_range.get_end()),
+            data_frames: self.data_frames.split_off(&split_vpn).into_iter().collect(),
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        };
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        new_area
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
