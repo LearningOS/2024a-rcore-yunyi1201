@@ -2,10 +2,10 @@
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
-use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
+use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::syscall::TaskInfo;
 use crate::timer::get_time_ms;
@@ -55,6 +55,14 @@ pub struct TaskControlBlockInner {
 
     /// Maintain the execution status of the current process
     pub task_status: TaskStatus,
+
+    /// task priority
+    /// default is 16
+    pub prio: usize,
+
+    /// stride scheduling
+    /// default is 0
+    pub stride: usize,
 
     /// Application address space
     pub memory_set: MemorySet,
@@ -123,6 +131,10 @@ impl TaskControlBlock {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
                     base_size: user_sp,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    prio: 16,
+                    stride: 0,
+                    first_scheduled: None,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
                     memory_set,
@@ -211,6 +223,9 @@ impl TaskControlBlock {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
+                    // inherit parent's prio and stride
+                    prio: parent_inner.prio,
+                    stride: parent_inner.stride,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
                     memory_set,
@@ -249,6 +264,12 @@ impl TaskControlBlock {
             syscall_times: inner.syscall_times,
             time: get_time_ms() - inner.first_scheduled.unwrap(),
         }
+    }
+
+    ///
+    pub fn add_child(&self, child: Arc<TaskControlBlock>) {
+        let mut inner = self.inner_exclusive_access();
+        inner.children.push(child);
     }
 
     /// check virtual page is maped in current task
