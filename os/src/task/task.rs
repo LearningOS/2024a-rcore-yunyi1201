@@ -4,7 +4,11 @@ use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
+use crate::timer::get_time_ms;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -229,6 +233,45 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Record the number of times a syscall is called
+    pub fn record_syscall(&self, syscall_number: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.syscall_times[syscall_number] += 1;
+    }
+
+    /// Get the task information
+    pub fn get_task_info(&self, info: &mut TaskInfo) {
+        let inner = self.inner_exclusive_access();
+        *info = TaskInfo {
+            status: TaskStatus::Running,
+            syscall_times: inner.syscall_times,
+            time: get_time_ms() - inner.first_scheduled.unwrap(),
+        }
+    }
+
+    /// check virtual page is maped in current task
+    pub fn is_mapped(&self, va: crate::mm::VirtAddr) -> bool {
+        let inner = self.inner.exclusive_access();
+
+        inner.memory_set.is_mapped(va.into())
+    }
+
+    /// map area structure, controls a contiguous piece of virtual memory
+    pub fn map_area(&self, start: usize, end: usize, permission: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.memory_set.insert_framed_area(
+            start.into(),
+            end.into(),
+            MapPermission::from(permission) | MapPermission::U,
+        );
+    }
+
+    /// unmap area structure, controls a contiguous piece of virtual memory
+    pub fn unmap_area(&self, start: usize, end: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.memory_set.unmap_area(start, end);
     }
 
     /// get pid of process

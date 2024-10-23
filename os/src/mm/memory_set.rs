@@ -440,6 +440,21 @@ bitflags! {
         const U = 1 << 4;
     }
 }
+impl From<usize> for MapPermission {
+    fn from(perm: usize) -> Self {
+        let mut map_perm = MapPermission::empty();
+        if perm & 1 != 0 {
+            map_perm |= MapPermission::R;
+        }
+        if perm & 2 != 0 {
+            map_perm |= MapPermission::W;
+        }
+        if perm & 4 != 0 {
+            map_perm |= MapPermission::X;
+        }
+        map_perm
+    }
+}
 
 /// remap test in kernel space
 #[allow(unused)]
