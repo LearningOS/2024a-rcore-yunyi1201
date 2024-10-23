@@ -9,6 +9,17 @@ use crate::{
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next, TaskStatus,
+    loader::get_app_data_by_name,
+    mm::{copy_to_user, translated_byte_buffer, translated_refmut, translated_str},
+    syscall::{
+        SYSCALL_EXEC, SYSCALL_EXIT, SYSCALL_FORK, SYSCALL_GETPID, SYSCALL_GET_TIME, SYSCALL_MMAP,
+        SYSCALL_MUNMAP, SYSCALL_SET_PRIORITY, SYSCALL_SPAWN, SYSCALL_TASK_INFO, SYSCALL_WAITPID,
+        SYSCALL_YIELD,
+    },
+    task::{
+        add_task, current_task, current_user_token, exit_current_and_run_next,
+        get_current_task_info, is_mapped, map_current_area, munmap_current_area, record_syscall,
+        set_current_priority, suspend_current_and_run_next, TaskControlBlock, TaskStatus,
     },
 };
 
@@ -247,10 +258,15 @@ pub fn sys_spawn(path: *const u8) -> isize {
 }
 
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if prio <= 1 {
+        return -1;
+    }
+    record_syscall(SYSCALL_SET_PRIORITY);
+    set_current_priority(prio as usize);
+    prio
 }

@@ -300,6 +300,12 @@ impl TaskControlBlock {
         self.pid.0
     }
 
+    /// set current task's priority
+    pub fn set_priority(&self, prio: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.prio = prio;
+    }
+
     /// change the location of the program break. return None if failed.
     pub fn change_program_brk(&self, size: i32) -> Option<usize> {
         let mut inner = self.inner_exclusive_access();

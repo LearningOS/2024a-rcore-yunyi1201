@@ -138,3 +138,8 @@ pub fn map_current_area(start: usize, end: usize, permission: usize) {
 pub fn munmap_current_area(start: usize, end: usize) {
     current_task().unwrap().unmap_area(start, end);
 }
+
+/// set current task's priority
+pub fn set_current_priority(priority: usize) {
+    current_task().unwrap().set_priority(priority);
+}
