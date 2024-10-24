@@ -9,7 +9,8 @@ use bitflags::bitflags;
 use spin::{Mutex, MutexGuard};
 /// Virtual filesystem layer over easy-fs
 pub struct Inode {
-    inode_id: u32,
+    /// inode-id
+    pub inode_id: u32,
     block_id: usize,
     block_offset: usize,
     fs: Arc<Mutex<EasyFileSystem>>,

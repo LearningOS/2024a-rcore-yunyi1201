@@ -1,5 +1,6 @@
 //! Process management syscalls
 //!
+
 use alloc::sync::Arc;
 
 use crate::{
@@ -247,9 +248,12 @@ pub fn sys_spawn(path: *const u8) -> isize {
     let path = translated_str(current_user_token(), path);
     debug!("spawn: {:?}", path);
     if let Some(app_data) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let inner_inode = app_data.inner.exclusive_access();
+        debug!("inode-id is {}", inner_inode.inode.inode_id);
+        drop(inner_inode);
         let current_task = current_task().unwrap();
-
         let elf_data = app_data.read_all();
+        debug!("{}\'data len is {}", path, elf_data.len());
         let new_task = Arc::new(TaskControlBlock::new(&elf_data.as_slice()));
         let mut new_task_inner = new_task.inner_exclusive_access();
         let pid = new_task.getpid();
