@@ -85,6 +85,7 @@ pub struct DiskInode {
     pub direct: [u32; INODE_DIRECT_COUNT],
     pub indirect1: u32,
     pub indirect2: u32,
+    pub link_count: u32,
     type_: DiskInodeType,
 }
 
@@ -93,6 +94,7 @@ impl DiskInode {
     /// indirect1 and indirect2 block are allocated only when they are needed
     pub fn initialize(&mut self, type_: DiskInodeType) {
         self.size = 0;
+        self.link_count = 1;
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
@@ -386,6 +388,19 @@ impl DiskInode {
             start = end_current_block;
         }
         write_size
+    }
+
+    /// increase link count
+    #[allow(unused)]
+    pub fn increase_link_count(&mut self) {
+        self.link_count += 1;
+    }
+    /// decrease link count
+    #[allow(unused)]
+    pub fn decrease_link_count(&mut self) -> u32 {
+        let old_link_count = self.link_count;
+        self.link_count -= 1;
+        old_link_count
     }
 }
 /// A directory entry

@@ -7,6 +7,7 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
+use crate::fs::Stat;
 use crate::sync::UPSafeCell;
 use crate::syscall::TaskInfo;
 use crate::trap::TrapContext;
@@ -142,4 +143,9 @@ pub fn munmap_current_area(start: usize, end: usize) {
 /// set current task's priority
 pub fn set_current_priority(priority: usize) {
     current_task().unwrap().set_priority(priority);
+}
+
+/// get current task's open file stat
+pub fn get_current_task_fd_stat(fd: usize) -> Option<Stat> {
+    current_task().unwrap().get_file_stat(fd)
 }

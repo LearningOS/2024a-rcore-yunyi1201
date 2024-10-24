@@ -1,11 +1,11 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
+use crate::config::MAX_SYSCALL_NUM;
 use crate::config::TRAP_CONTEXT_BASE;
-use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
+use crate::fs::Stat;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::syscall::TaskInfo;
 use crate::timer::get_time_ms;
@@ -49,6 +49,12 @@ pub struct TaskControlBlockInner {
     /// Application data can only appear in areas
     /// where the application address space is lower than base_size
     pub base_size: usize,
+
+    /// Record the number of times a syscall is called
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
+    /// time of first scheduled
+    pub first_scheduled: Option<usize>,
 
     /// Save task context
     pub task_cx: TaskContext,
@@ -221,6 +227,8 @@ impl TaskControlBlock {
             kernel_stack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    first_scheduled: None,
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
                     // inherit parent's prio and stride
@@ -330,6 +338,16 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// get the sepciifc file stat in fd_table
+    pub fn get_file_stat(&self, fd: usize) -> Option<Stat> {
+        let inner = self.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return None;
+        }
+
+        Some(inner.fd_table[fd].clone().unwrap().stat())
     }
 }
 

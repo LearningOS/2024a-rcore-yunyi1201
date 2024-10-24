@@ -12,6 +12,7 @@ mod heap_allocator;
 mod memory_set;
 mod page_table;
 
+pub use address::copy_to_user;
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use frame_allocator::{frame_alloc, frame_dealloc, FrameTracker};
