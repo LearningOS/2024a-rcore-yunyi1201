@@ -1,7 +1,8 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat, link, unlink};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer, translated_refmut};
+use crate::fs::{inode_link, inode_unlink, open_file, OpenFlags};
+use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::task::{current_task, current_user_token};
+use easy_fs::Stat;
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     trace!("kernel:pid[{}] sys_write", current_task().unwrap().pid.0);
@@ -78,40 +79,51 @@ pub fn sys_close(fd: usize) -> isize {
 /// YOUR JOB: Implement fstat.
 pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fstat",
+        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
+    let user_token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
+
     if fd >= inner.fd_table.len() {
         return -1;
     }
+
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
-        drop(inner);
-        let stat = translated_refmut(current_user_token(), st);
-        file.get_stat(stat);
+        let mut stat = Stat::default();
+        file.stat(&mut stat);
+
+        let user_ptr = translated_refmut(user_token, st);
+        *user_ptr = stat;
+        0
+    } else {
+        -1
     }
-    else {
-        return -1;
-    }
-    0
 }
 
 /// YOUR JOB: Implement linkat.
 pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_linkat",
+        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
     let token = current_user_token();
-    let _old_name = translated_str(token, old_name);
-    let _new_name = translated_str(token, new_name);
-    if _old_name.eq(_new_name.as_str()) {
+    let old_name = translated_str(token, old_name);
+    let new_name = translated_str(token, new_name);
+
+    if old_name == new_name {
         return -1;
     }
-    link(_old_name.as_str(), _new_name.as_str())
 
+    match inode_link(&old_name, &new_name) {
+        Ok(_) => 0,
+        Err(message) => {
+            println!("[kernel] error from sys_linkat, message = {:?}", message);
+            -1
+        }
+    }
 }
 
 /// YOUR JOB: Implement unlinkat.
@@ -121,6 +133,13 @@ pub fn sys_unlinkat(name: *const u8) -> isize {
         current_task().unwrap().pid.0
     );
     let token = current_user_token();
-    let _name = translated_str(token, name);
-    unlink(_name.as_str())
+    let name = translated_str(token, name);
+
+    match inode_unlink(&name) {
+        Ok(_) => 0,
+        Err(message) => {
+            println!("[kernel] error from sys_unlinkat, message = {:?}", message);
+            -1
+        }
+    }
 }

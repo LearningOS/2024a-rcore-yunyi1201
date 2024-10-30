@@ -5,7 +5,9 @@ use super::{
 use crate::BLOCK_SZ;
 use alloc::sync::Arc;
 use spin::Mutex;
-///An easy file system on block
+
+/// An easy file system on block
+
 pub struct EasyFileSystem {
     ///Real device
     pub block_device: Arc<dyn BlockDevice>,
@@ -29,16 +31,23 @@ impl EasyFileSystem {
         // calculate block size of areas & create bitmaps
         let inode_bitmap = Bitmap::new(1, inode_bitmap_blocks as usize);
         let inode_num = inode_bitmap.maximum();
+        // 根据inode位图的大小计算inode区域至少需要多少个块才能够使得inode位图之中的每一个bit都能够
+        // 有一个实际的inode可以对应，这样就确定了inode位图区域和inode区域的大小
         let inode_area_blocks =
             ((inode_num * core::mem::size_of::<DiskInode>() + BLOCK_SZ - 1) / BLOCK_SZ) as u32;
         let inode_total_blocks = inode_bitmap_blocks + inode_area_blocks;
+        // 剩下的块都分配给数据块位图区域和数据块区域
         let data_total_blocks = total_blocks - 1 - inode_total_blocks;
+        // 我们希望数据块位图中的每个bit仍然能够对应到一个数据块，但是数据块位图又不能过小，
+        // 不然会造成某些数据块永远不会被使用。因此数据块位图区域最合理的大小是剩余的块数除以
+        // 4097 再上取整，因为位图中的每个块能够对应 4096 个数据块。其余的块就都作为数据块使用。
         let data_bitmap_blocks = (data_total_blocks + 4096) / 4097;
         let data_area_blocks = data_total_blocks - data_bitmap_blocks;
         let data_bitmap = Bitmap::new(
             (1 + inode_bitmap_blocks + inode_area_blocks) as usize,
             data_bitmap_blocks as usize,
         );
+
         let mut efs = Self {
             block_device: Arc::clone(&block_device),
             inode_bitmap,
@@ -82,6 +91,7 @@ impl EasyFileSystem {
         Arc::new(Mutex::new(efs))
     }
     /// Open a block device as a filesystem
+    ///
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Arc<Mutex<Self>> {
         // read SuperBlock
         get_block_cache(0, Arc::clone(&block_device))
@@ -111,6 +121,7 @@ impl EasyFileSystem {
         // release efs lock
         Inode::new(block_id, block_offset, Arc::clone(efs), block_device)
     }
+
     /// Get inode by id
     pub fn get_disk_inode_pos(&self, inode_id: u32) -> (u32, usize) {
         let inode_size = core::mem::size_of::<DiskInode>();
@@ -125,6 +136,8 @@ impl EasyFileSystem {
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
         self.data_area_start_block + data_block_id
     }
+    // ------------------- end
+
     /// Allocate a new inode
     pub fn alloc_inode(&mut self) -> u32 {
         self.inode_bitmap.alloc(&self.block_device).unwrap() as u32
@@ -134,6 +147,7 @@ impl EasyFileSystem {
     pub fn alloc_data(&mut self) -> u32 {
         self.data_bitmap.alloc(&self.block_device).unwrap() as u32 + self.data_area_start_block
     }
+
     /// Deallocate a data block
     pub fn dealloc_data(&mut self, block_id: u32) {
         get_block_cache(block_id as usize, Arc::clone(&self.block_device))

@@ -6,7 +6,7 @@ use core::fmt::{Debug, Formatter, Result};
 /// Magic number for sanity check
 const EFS_MAGIC: u32 = 0x3b800001;
 /// The max number of direct inodes
-const INODE_DIRECT_COUNT: usize = 27;
+const INODE_DIRECT_COUNT: usize = 28;
 /// The max length of inode name
 const NAME_LENGTH_LIMIT: usize = 27;
 /// The max number of indirect1 inodes
@@ -20,15 +20,18 @@ const INDIRECT1_BOUND: usize = DIRECT_BOUND + INODE_INDIRECT1_COUNT;
 /// The upper bound of indirect2 inode indexs
 #[allow(unused)]
 const INDIRECT2_BOUND: usize = INDIRECT1_BOUND + INODE_INDIRECT2_COUNT;
+
 /// Super block of a filesystem
+///
+/// 磁盘上的数据结构，存放在磁盘上编号为0的块的起始处
 #[repr(C)]
 pub struct SuperBlock {
-    magic: u32,
-    pub total_blocks: u32,
-    pub inode_bitmap_blocks: u32,
-    pub inode_area_blocks: u32,
-    pub data_bitmap_blocks: u32,
-    pub data_area_blocks: u32,
+    magic: u32,                   // 用于文件系统合法性验证的魔数
+    pub total_blocks: u32,        // 给出文件系统的总块数
+    pub inode_bitmap_blocks: u32, // 索引节点位图块数
+    pub inode_area_blocks: u32,   // 索引节点区域块数
+    pub data_bitmap_blocks: u32,  // 数据块位图块数
+    pub data_area_blocks: u32,    // 数据块区域块数
 }
 
 impl Debug for SuperBlock {
@@ -67,6 +70,7 @@ impl SuperBlock {
         self.magic == EFS_MAGIC
     }
 }
+
 /// Type of a disk inode
 #[derive(PartialEq)]
 pub enum DiskInodeType {
@@ -76,17 +80,41 @@ pub enum DiskInodeType {
 
 /// A indirect block
 type IndirectBlock = [u32; BLOCK_SZ / 4];
-/// A data block
+/// ## A data block
+///
+/// 作为一个文件而言，它的内容在文件系统看来没有任何既定的格式
+/// 都只是一个字节序列，因此每个保存内容的数据块都只是一个字节数组
 type DataBlock = [u8; BLOCK_SZ];
-/// A disk inode
+
+/// ## A disk inode 磁盘上的索引节点
+///
+/// 每一个文件/目录在磁盘上均以一个DiskInode的形式进行存储
 #[repr(C)]
 pub struct DiskInode {
-    pub size: u32,
+    /// 文件/目录内容的字节数
+    pub size: u32, // 为了尽可能节约空间，在进行索引的时候，块的编号使用一个u32存储
+    /// ## 存储文件/目录内容的数据块的直接索引
+    ///
+    /// 最多可以指向 INODE_DIRECT_COUNT 个数据块，当取值为 28 的时候，
+    /// 通过直接索引可以找到 14KiB 的内容。
     pub direct: [u32; INODE_DIRECT_COUNT],
+    /// ## 一级索引
+    ///
+    /// 这个一级索引块之中的每一个 u32 都用来指向数据块区域之中
+    /// 一个保存该文件内容的数据块，因此，最多能够索引 512/4 = 128
+    /// 个数据块，对应 64KiB 的内容
     pub indirect1: u32,
+    /// ## 二级索引
+    ///
+    /// 指向一个位于数据块区域中的二级索引块。二级索引块中的每个 u32
+    /// 指向一个不同的一级索引块，这些一级索引块也位于数据块区域中。
+    /// 因此，通过二级间接索引最多能够索引的 128 x 64KiB = 8MiB 的内容。
     pub indirect2: u32,
-    pub link_num: u32,
+    /// 索引节点的类型
     type_: DiskInodeType,
+    /// 记录文件的硬链接数（hard link count）
+    /// 也就是指向该文件节点（inode）的目录条目的数量
+    pub nlink: u8,
 }
 
 impl DiskInode {
@@ -97,8 +125,8 @@ impl DiskInode {
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
-        self.link_num = 1;
         self.type_ = type_;
+        self.nlink = 1;
     }
     /// Whether this inode is a directory
     pub fn is_dir(&self) -> bool {
@@ -109,6 +137,7 @@ impl DiskInode {
     pub fn is_file(&self) -> bool {
         self.type_ == DiskInodeType::File
     }
+    // 一些辅助方法来确定在容量扩充的时候额外需要多少块 ----------------- start
     /// Return block number correspond to size.
     pub fn data_blocks(&self) -> u32 {
         Self::_data_blocks(self.size)
@@ -138,7 +167,11 @@ impl DiskInode {
         assert!(new_size >= self.size);
         Self::total_blocks(new_size) - Self::total_blocks(self.size)
     }
+    // ------------------ end
     /// Get id of block given inner id
+    ///
+    /// get_block_id 方法体现了 DiskInode 最重要的数据块索引功能，它可以从索引中查到它自身用于保存文件内容的第
+    /// block_id 个数据块的块编号，这样后续才能对这个数据块进行访问：
     pub fn get_block_id(&self, inner_id: u32, block_device: &Arc<dyn BlockDevice>) -> u32 {
         let inner_id = inner_id as usize;
         if inner_id < INODE_DIRECT_COUNT {
@@ -181,6 +214,8 @@ impl DiskInode {
         }
         // alloc indirect1
         if total_blocks > INODE_DIRECT_COUNT as u32 {
+            // 当在上一个 while 循环之中 INODE_DIRECT_COUNT < total_blocks
+            // 时，就会进入这个判断
             if current_blocks == INODE_DIRECT_COUNT as u32 {
                 self.indirect1 = new_blocks.next().unwrap();
             }
@@ -200,6 +235,8 @@ impl DiskInode {
             });
         // alloc indirect2
         if total_blocks > INODE_INDIRECT1_COUNT as u32 {
+            // 当在 modify 中的 while 中， INODE_INDIRECT1_COUNT < total_blocks
+            // 就会进入这个判断
             if current_blocks == INODE_INDIRECT1_COUNT as u32 {
                 self.indirect2 = new_blocks.next().unwrap();
             }
@@ -326,7 +363,7 @@ impl DiskInode {
         let mut read_size = 0usize;
         loop {
             // calculate end of current block
-            let mut end_current_block = (start / BLOCK_SZ + 1) * BLOCK_SZ;
+            let mut end_current_block = (start / BLOCK_SZ + 1) * BLOCK_SZ; // 计算得到的是start所在块的末尾字节偏移量
             end_current_block = end_current_block.min(end);
             // read and update read size
             let block_read_size = end_current_block - start;
@@ -390,7 +427,13 @@ impl DiskInode {
         write_size
     }
 }
+
 /// A directory entry
+///
+/// 每个目录项都是一个二元组，二元组的首个元素是目录下面的一个文件
+/// （或子目录）的文件名（或目录名），另一个元素则是文件（或子目录）
+/// 所在的索引节点编号。目录项相当于目录树结构上的子树节点，我们需要
+/// 通过它来一级一级的找到实际要访问的文件或目录。
 #[repr(C)]
 pub struct DirEntry {
     name: [u8; NAME_LENGTH_LIMIT + 1],
@@ -416,6 +459,8 @@ impl DirEntry {
             inode_id,
         }
     }
+    // 在从目录的内容中读取目录项或者是将目录项写入目录的时候，我们需要将目录项转化为缓冲区（即字节切片）
+    // 的形式来符合索引节点 Inode 数据结构中的 read_at 或 write_at 方法接口的要求
     /// Serialize into bytes
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self as *const _ as usize as *const u8, DIRENT_SZ) }

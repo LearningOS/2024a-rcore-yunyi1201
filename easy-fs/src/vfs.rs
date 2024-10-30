@@ -5,11 +5,13 @@ use super::{
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use bitflags::bitflags;
 use spin::{Mutex, MutexGuard};
+
 /// Virtual filesystem layer over easy-fs
 pub struct Inode {
-    block_id: usize,
-    block_offset: usize,
+    block_id: usize,     // 对应的DiskInode保存在磁盘上的块号
+    block_offset: usize, // 对应的DiskInode保存在磁盘上的块内偏移量
     fs: Arc<Mutex<EasyFileSystem>>,
     block_device: Arc<dyn BlockDevice>,
 }
@@ -30,18 +32,21 @@ impl Inode {
         }
     }
     /// Call a function over a disk inode to read it
+    /// 主要用于简化对于Inode对应的磁盘上的DiskInode的访问流程
     fn read_disk_inode<V>(&self, f: impl FnOnce(&DiskInode) -> V) -> V {
         get_block_cache(self.block_id, Arc::clone(&self.block_device))
             .lock()
             .read(self.block_offset, f)
     }
     /// Call a function over a disk inode to modify it
+    /// 主要用于简化对于Inode对应的磁盘上的DiskInode的访问流程
     fn modify_disk_inode<V>(&self, f: impl FnOnce(&mut DiskInode) -> V) -> V {
         get_block_cache(self.block_id, Arc::clone(&self.block_device))
             .lock()
             .modify(self.block_offset, f)
     }
     /// Find inode under a disk inode by name
+    /// 返回目标文件的 Inode Id
     fn find_inode_id(&self, name: &str, disk_inode: &DiskInode) -> Option<u32> {
         // assert it is a directory
         assert!(disk_inode.is_dir());
@@ -58,11 +63,21 @@ impl Inode {
         }
         None
     }
+
+    // 包括find在内，所有暴露给文件系统的使用者的文件系统操作（还有接下来要介绍的几种），
+    // 全程都需要持有 EasyFileSystem 的互斥锁（相对而言，文件系统内部的操作，如之前的Inode::new
+    // 还是上面的 find_inode_id，都是嘉定在已经持有efs锁的情况下才被调用的，因此它们不应尝试获取
+    // 锁）。这能够保证在多核情况下，同时最多只能有一个核在进行文件系统的相关操作。
+    //
+    // 这样也许会带来一些不必要的性能损失，但我们目前暂时先这样做。如果我们在这里加锁的话，
+    // 其实就能够保证块缓存的互斥访问了。
+
     /// Find inode under current inode by name
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
         let fs = self.fs.lock();
         self.read_disk_inode(|disk_inode| {
             self.find_inode_id(name, disk_inode).map(|inode_id| {
+                // 在这里最要注意的一点是 inode_id 不是 block_id，它们之间的粒度是不一样的
                 let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
                 Arc::new(Self::new(
                     block_id,
@@ -184,56 +199,166 @@ impl Inode {
         block_cache_sync_all();
     }
 
-    /// link
-    pub fn link(&self, old_name: &str, new_name: &str) -> isize {
+    /// Read stat from current inode
+    pub fn read_stat(&self, st: &mut Stat) {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| {
+            st.dev = 0;
+            st.ino = self.block_id as u64;
+            st.mode = if disk_inode.is_dir() {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            };
+
+            st.nlink = disk_inode.nlink as u32;
+        });
+    }
+
+    /// Link a new dir entry to a file.
+    /// warn: this method must be called by dir inode.
+    pub fn link(&self, old_name: &str, new_name: &str) -> Result<(), &'static str> {
         let mut fs = self.fs.lock();
 
-        if let Some(new_inode_id) = self.read_disk_inode(|disk_inode| self.find_inode_id(old_name, disk_inode)) {
+        let old_inode_id =
+            self.read_disk_inode(|root_inode| self.find_inode_id(old_name, root_inode));
+
+        if let Some(old_inode_id) = old_inode_id {
+            let (block_id, block_offset) = fs.get_disk_inode_pos(old_inode_id);
+
+            get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+                .lock()
+                // Increase the `nlink` of target DiskInode
+                .modify(block_offset, |n: &mut DiskInode| n.nlink += 1);
+
+            // Insert `newname` into directory.
             self.modify_disk_inode(|root_inode| {
                 let file_count = (root_inode.size as usize) / DIRENT_SZ;
                 let new_size = (file_count + 1) * DIRENT_SZ;
                 self.increase_size(new_size as u32, root_inode, &mut fs);
-                let dirent = DirEntry::new(new_name, new_inode_id);
-                root_inode.write_at(file_count * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+                let dirent = DirEntry::new(new_name, old_inode_id);
+                root_inode.write_at(
+                    file_count * DIRENT_SZ,
+                    dirent.as_bytes(),
+                    &self.block_device,
+                );
             });
-            0
-        }
-        else {
-            -1
+
+            block_cache_sync_all();
+            Ok(())
+        } else {
+            Err("Can't find target file!")
         }
     }
 
-    /// unlink
-    pub fn unlink(&self, name: &str) -> isize {
+    /// unlink a dir entry of a file
+    pub fn unlink(&self, name: &str) -> Result<(), &'static str> {
+        let mut fs = self.fs.lock();
+
+        let mut inode_id: Option<u32> = None;
+        let mut v: Vec<DirEntry> = Vec::new();
+
         self.modify_disk_inode(|root_inode| {
             let file_count = (root_inode.size as usize) / DIRENT_SZ;
-            let mut dirent = DirEntry::empty();
             for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
                 assert_eq!(
-                    root_inode.read_at(DIRENT_SZ * i, dirent.as_bytes_mut(), &self.block_device),
-                    DIRENT_SZ
+                    root_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ,
                 );
-                if dirent.name() == name {
-                    root_inode.write_at(i * DIRENT_SZ, DirEntry::empty().as_bytes(), &self.block_device);
-                    return 0;
+                if dirent.name() != name {
+                    v.push(dirent);
+                } else {
+                    inode_id = Some(dirent.inode_id());
                 }
             }
-            -1
-        })
-    }
+        });
 
-    /// increase link num
-    pub fn increase_link_num(&self) {
-        self.modify_disk_inode(|disk_inode| disk_inode.link_num += 1)
-    }
+        if let Some(inode_id) = inode_id {
+            self.modify_disk_inode(|root_inode| {
+                let size = root_inode.size;
+                let data_blocks_dealloc = root_inode.clear_size(&self.block_device);
 
-    /// decrease link num
-    pub fn decrease_link_num(&self) {
-        self.modify_disk_inode(|disk_inode| disk_inode.link_num -= 1)
-    }
+                assert!(data_blocks_dealloc.len() == DiskInode::total_blocks(size) as usize);
 
-    /// get link num
-    pub fn get_link_num(&self) -> u32{
-        self.read_disk_inode(|disk_inode| disk_inode.link_num)
+                for data_block in data_blocks_dealloc.into_iter() {
+                    fs.dealloc_data(data_block);
+                }
+
+                self.increase_size((v.len() * DIRENT_SZ) as u32, root_inode, &mut fs);
+                for (i, dirent) in v.iter().enumerate() {
+                    root_inode.write_at(i * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+                }
+            });
+
+            // Get position of old inode.
+            let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+
+            // Find target `DiskInode` then modify!
+            get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+                .lock()
+                .modify(block_offset, |n: &mut DiskInode| {
+                    // Decrease `nlink`.
+                    n.nlink -= 1;
+                    // If `nlink` is zero, free all data_block through `clear_size()`.
+                    if n.nlink == 0 {
+                        let size = n.size;
+                        let data_blocks_dealloc = n.clear_size(&self.block_device);
+                        assert!(
+                            data_blocks_dealloc.len() == DiskInode::total_blocks(size) as usize
+                        );
+                        for data_block in data_blocks_dealloc.into_iter() {
+                            fs.dealloc_data(data_block);
+                        }
+                    }
+                });
+
+            // Since we may have writed the cached block, we need to flush the cache.
+            block_cache_sync_all();
+            Ok(())
+        } else {
+            Err("Can't find target file!")
+        }
+    }
+}
+
+bitflags! {
+    /// The mode of a inode
+    /// whether a directory or a file
+    pub struct StatMode: u32 {
+        /// null
+        const NULL  = 0;
+        /// directory
+        const DIR   = 0o040000;
+        /// ordinary regular file
+        const FILE  = 0o100000;
+    }
+}
+
+/// The state of a inode(file)
+#[repr(C)]
+#[derive(Debug)]
+pub struct Stat {
+    /// ID of device containing file
+    pub dev: u64,
+    /// inode number
+    pub ino: u64,
+    /// file type and mod
+    pub mode: StatMode,
+    /// number of hard links
+    pub nlink: u32,
+    /// unused pad
+    pad: [u64; 7],
+}
+
+impl Default for Stat {
+    fn default() -> Self {
+        Self {
+            dev: Default::default(),
+            ino: Default::default(),
+            mode: StatMode::NULL,
+            nlink: Default::default(),
+            pad: Default::default(),
+        }
     }
 }
