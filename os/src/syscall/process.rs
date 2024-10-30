@@ -1,18 +1,16 @@
 //! Process management syscalls
 //!
-
 use alloc::sync::Arc;
 
 use crate::{
     config::MAX_SYSCALL_NUM,
     fs::{open_file, OpenFlags},
-    mm::{copy_to_user, translated_byte_buffer, translated_refmut, translated_str},
+    mm::{translated_refmut, translated_str, VirtAddr, VirtPageNum},
+    timer::get_time_ms,
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        get_current_task_info, is_mapped, map_current_area, munmap_current_area,
-        set_current_priority, suspend_current_and_run_next, TaskControlBlock, TaskStatus,
+        suspend_current_and_run_next, set_task_info, TaskStatus, mmap, munmap
     },
-    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -33,16 +31,6 @@ pub struct TaskInfo {
     pub time: usize,
 }
 
-impl TaskInfo {
-    fn new() -> Self {
-        TaskInfo {
-            status: TaskStatus::UnInit,
-            syscall_times: [0; MAX_SYSCALL_NUM],
-            time: 0,
-        }
-    }
-}
-
 pub fn sys_exit(exit_code: i32) -> ! {
     trace!("kernel:pid[{}] sys_exit", current_task().unwrap().pid.0);
     exit_current_and_run_next(exit_code);
@@ -50,7 +38,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
-    trace!("kernel: sys_yield");
+    //trace!("kernel: sys_yield");
     suspend_current_and_run_next();
     0
 }
@@ -92,7 +80,7 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel: sys_waitpid");
+    //trace!("kernel: sys_waitpid");
     let task = current_task().unwrap();
     // find a child process
 
@@ -131,63 +119,65 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!("kernel: sys_get_time");
-    let us = get_time_us();
-    let buffers = translated_byte_buffer(
-        current_user_token(),
-        ts as *const u8,
-        core::mem::size_of::<TimeVal>(),
+    trace!(
+        "kernel:pid[{}] sys_get_time",
+        current_task().unwrap().pid.0
     );
-
-    let time_val = TimeVal {
-        sec: us / 1_000_000,
-        usec: us % 1_000_000,
+    let ms = get_time_ms();
+    let ktime = translated_refmut(current_user_token(), ts);
+    *ktime = TimeVal {
+            sec: ms / 1_000,
+            usec: ms * 1_000,
     };
-    unsafe {
-        copy_to_user(
-            buffers,
-            core::slice::from_raw_parts(
-                &time_val as *const _ as *const u8,
-                core::mem::size_of::<TimeVal>(),
-            ),
-        )
-    }
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
 pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
-    trace!("kernel: sys_task_info NOT IMPLEMENTED YET!");
-
-    let buffers = translated_byte_buffer(
-        current_user_token(),
-        ti as *const u8,
-        core::mem::size_of::<TaskInfo>(),
+    trace!(
+        "kernel:pid[{}] sys_task_info NOT IMPLEMENTED",
+        current_task().unwrap().pid.0
     );
-    let mut task_info = TaskInfo::new();
-    get_current_task_info(&mut task_info);
-
-    unsafe {
-        copy_to_user(
-            buffers,
-            core::slice::from_raw_parts(
-                &task_info as *const _ as *const u8,
-                core::mem::size_of::<TaskInfo>(),
-            ),
-        )
-    }
+    let kti = translated_refmut(current_user_token(), ti);
+    set_task_info(kti);
+    0
 }
 
-// YOUR JOB: Implement mmap.
+/// YOUR JOB: Implement mmap.
 pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
-    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    // if 'start' is not page aligned, return -1
-    if start % crate::config::PAGE_SIZE != 0 {
+    trace!(
+        "kernel:pid[{}] sys_mmap",
+        current_task().unwrap().pid.0
+    );
+    let start_vaddr: VirtAddr = start.into();
+    if !start_vaddr.aligned() {
         return -1;
     }
-    // port is not valid, return -1
-    if port & !0x7 != 0 || port & 0x7 == 0 {
+    if port &!0x7 != 0 || port & 0x7 == 0 {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let end_vaddr: VirtAddr = (start + len).into();
+    let start_vpn: VirtPageNum = start_vaddr.into();
+    let end_vpn: VirtPageNum = end_vaddr.ceil();
+
+    mmap(start_vpn, end_vpn, port)
+
+}
+
+/// YOUR JOB: Implement munmap.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_munmap",
+        current_task().unwrap().pid.0
+    );
+    let start_vaddr: VirtAddr = start.into();
+
+    if !start_vaddr.aligned() {
         return -1;
     }
 
@@ -195,40 +185,12 @@ pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
         return 0;
     }
 
-    // align len to page size
-    let len = (len + crate::config::PAGE_SIZE - 1) & !(crate::config::PAGE_SIZE - 1);
+    let end_vaddr: VirtAddr = (start + len).into();
+    let start_vpn: VirtPageNum = start_vaddr.into();
+    let end_vpn: VirtPageNum = end_vaddr.ceil();
 
-    assert!(len % crate::config::PAGE_SIZE == 0);
+    munmap(start_vpn, end_vpn)
 
-    let mut current = start;
-    while current < start + len {
-        if is_mapped(current.into()) {
-            return -1;
-        }
-        current += crate::config::PAGE_SIZE;
-    }
-    map_current_area(start, start + len, port);
-    0
-}
-
-// YOUR JOB: Implement munmap.
-pub fn sys_munmap(start: usize, len: usize) -> isize {
-    trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    if (start % crate::config::PAGE_SIZE) != 0 {
-        return -1;
-    }
-
-    let len = (len + crate::config::PAGE_SIZE - 1) & (!(crate::config::PAGE_SIZE - 1));
-
-    let mut current = start;
-    while current < start + len {
-        if !is_mapped(current.into()) {
-            return -1;
-        }
-        current += crate::config::PAGE_SIZE;
-    }
-    munmap_current_area(start, start + len);
-    0
 }
 
 /// change data segment size
@@ -244,39 +206,57 @@ pub fn sys_sbrk(size: i32) -> isize {
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
 pub fn sys_spawn(path: *const u8) -> isize {
-    trace!("kernel: sys_spawn");
-    let path = translated_str(current_user_token(), path);
-    debug!("spawn: {:?}", path);
-    if let Some(app_data) = open_file(path.as_str(), OpenFlags::RDONLY) {
-        let inner_inode = app_data.inner.exclusive_access();
-        debug!("inode-id is {}", inner_inode.inode.inode_id);
-        drop(inner_inode);
-        let current_task = current_task().unwrap();
-        let elf_data = app_data.read_all();
-        debug!("{}\'data len is {}", path, elf_data.len());
-        let new_task = Arc::new(TaskControlBlock::new(&elf_data.as_slice()));
-        let mut new_task_inner = new_task.inner_exclusive_access();
-        let pid = new_task.getpid();
-        new_task_inner.parent = Some(Arc::downgrade(&current_task));
-        current_task.add_child(new_task.clone());
+    trace!(
+         "kernel:pid[{}] sys_spawn",
+         current_task().unwrap().pid.0
+     );
 
-        drop(new_task_inner);
-        add_task(new_task);
-        pid as isize
+    let path =translated_str(current_user_token(), path);
+    if let Some(app_inode)= open_file(path.as_str(),OpenFlags::RDONLY){
+        let elf_data = app_inode.read_all();
+        let task = current_task().unwrap().spawn(&elf_data);
+        add_task(task.clone());
+        task.pid.0 as isize
     } else {
         -1
     }
+    //I don't understand why this failed.
+    //let token = current_user_token();
+    //let path = translated_str(token, path);
+    //if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+    //    let current_task = current_task().unwrap();
+    //    let mut parent_inner = current_task.inner_exclusive_access();
+
+        //debug!("path: {}", path);
+
+    //    let data = app_inode.read_all();
+    //    let new_tcb = Arc::new(TaskControlBlock::new(data.as_slice()));
+    //    let mut inner = new_tcb.inner_exclusive_access();
+
+    //    inner.parent = Some(Arc::downgrade(&current_task));
+    //    parent_inner.children.push(new_tcb.clone());
+    //    drop(inner);
+
+    //    let pid = new_tcb.pid.0 as isize;
+
+    //    add_task(new_tcb);
+
+    //    return pid;
+    //}
+
 }
 
 // YOUR JOB: Set task priority.
 pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().pid.0
     );
-    if prio <= 1 {
-        return -1;
+    if prio >= 2 {
+        let current_task = current_task().unwrap();
+        let mut inner = current_task.inner_exclusive_access();
+        inner.priority = prio as u8;
+        return prio;
     }
-    set_current_priority(prio as usize);
-    prio
+    -1
 }

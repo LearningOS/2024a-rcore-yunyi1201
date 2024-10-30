@@ -1,7 +1,6 @@
 //! Implementation of physical and virtual address and page number.
 use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
-use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 
 const PA_WIDTH_SV39: usize = 56;
@@ -289,21 +288,3 @@ where
 }
 /// a simple range structure for virtual page number
 pub type VPNRange = SimpleRange<VirtPageNum>;
-
-/// copy src to user
-pub fn copy_to_user(data: Vec<&mut [u8]>, src: &[u8]) -> isize {
-    let mut writed_bytes = 0;
-    for buffer in data {
-        let len = buffer.len().min(src.len() - writed_bytes);
-        buffer[..len].copy_from_slice(&src[writed_bytes..writed_bytes + len]);
-        writed_bytes += len;
-        if writed_bytes >= src.len() {
-            break;
-        }
-    }
-    if writed_bytes == src.len() {
-        0
-    } else {
-        -1
-    }
-}

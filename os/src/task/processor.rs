@@ -7,10 +7,12 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
-use crate::fs::Stat;
 use crate::sync::UPSafeCell;
-use crate::syscall::TaskInfo;
 use crate::trap::TrapContext;
+use crate::timer::get_time_ms;
+use crate::syscall::TaskInfo;
+use crate::mm::VirtPageNum;
+use crate::config::BIG_STRIDE;
 use alloc::sync::Arc;
 use lazy_static::*;
 
@@ -63,8 +65,9 @@ pub fn run_tasks() {
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
-            if task_inner.first_scheduled.is_none() {
-                task_inner.first_scheduled = Some(crate::timer::get_time_ms());
+            task_inner.stride += BIG_STRIDE / task_inner.priority as u32;
+            if task_inner.start_time == 0 {
+                task_inner.start_time = get_time_ms();
             }
             // release coming task_inner manually
             drop(task_inner);
@@ -115,37 +118,36 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     }
 }
 
-/// record current task syscall invoke time
-pub fn record_syscall(syscall_number: usize) {
-    current_task().unwrap().record_syscall(syscall_number);
+/// Increase syscall times
+pub fn increase_syscall_times(syscall_id: usize) {
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.syscall_times[syscall_id] += 1;
+    
 }
 
-/// get take info
-pub fn get_current_task_info(info: &mut TaskInfo) {
-    current_task().unwrap().get_task_info(info);
+/// Set task info
+pub fn set_task_info(ti: *mut TaskInfo) {
+    let task = current_task().unwrap();
+    let task_inner = task.inner_exclusive_access();
+    let curr_time = get_time_ms();
+    unsafe {
+        (*ti).time = curr_time - task_inner.start_time;
+        (*ti).syscall_times = task_inner.syscall_times;
+        (*ti).status = TaskStatus::Running;
+    }
 }
 
-/// check virtual page is maped in current task
-pub fn is_mapped(va: crate::mm::VirtAddr) -> bool {
-    current_task().unwrap().is_mapped(va.into())
+/// To mmap
+pub fn mmap(start_vpn: VirtPageNum, end_vpn: VirtPageNum, port: usize) -> isize {
+    let task = current_task().unwrap();
+    let memo = task.inner_exclusive_access().memory_set.mmap(start_vpn, end_vpn, port);
+    memo
 }
 
-/// map area structure, controls a contiguous piece of virtual memory
-pub fn map_current_area(start: usize, end: usize, permission: usize) {
-    current_task().unwrap().map_area(start, end, permission);
-}
-
-/// unmap area structure, controls a contiguous piece of virtual memory
-pub fn munmap_current_area(start: usize, end: usize) {
-    current_task().unwrap().unmap_area(start, end);
-}
-
-/// set current task's priority
-pub fn set_current_priority(priority: usize) {
-    current_task().unwrap().set_priority(priority);
-}
-
-/// get current task's open file stat
-pub fn get_current_task_fd_stat(fd: usize) -> Option<Stat> {
-    current_task().unwrap().get_file_stat(fd)
+/// To munmap
+pub fn munmap(start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> isize {
+    let task = current_task().unwrap();
+    let memo = task.inner_exclusive_access().memory_set.munmap(start_vpn, end_vpn);
+    memo
 }

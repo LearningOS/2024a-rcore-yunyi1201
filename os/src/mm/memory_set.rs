@@ -40,6 +40,7 @@ pub fn kernel_token() -> usize {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_frames: BTreeMap<VirtPageNum, FrameTracker>
 }
 
 impl MemorySet {
@@ -48,6 +49,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_frames: BTreeMap::new()
         }
     }
     /// Get the page table token
@@ -319,60 +321,74 @@ impl MemorySet {
         }
     }
 
-    /// check if the vpn is mapped
-    #[allow(unused)]
-    pub fn is_mapped(&self, vpn: VirtPageNum) -> bool {
-        self.areas.iter().any(|area| {
-            area.vpn_range.get_start() <= vpn
-                && vpn < area.vpn_range.get_end()
-                && area.data_frames.contains_key(&vpn)
-        })
-    }
+    /// mmap
+    pub fn mmap(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum, port: usize) -> isize {
+         let mut flags = PTEFlags::empty();
+         let mut vpn = start_vpn;
 
-    /// unmap an continuous area
-    /// require that start is page-aligned
-    pub fn unmap_area(&mut self, start: usize, end: usize) {
-        assert!(start % PAGE_SIZE == 0);
-        let mut start_va: VirtAddr = start.into();
-        while start_va < end.into() {
-            let area = self.areas.iter_mut().enumerate().find(|(_, area)| {
-                area.vpn_range.get_start() <= start_va.into()
-                    && area.vpn_range.get_end() > start_va.into()
-            });
-            if let Some((index, area)) = area {
-                let end_va: VirtAddr = end.into();
-                if area.vpn_range.get_end() <= end_va.into()
-                    && area.vpn_range.get_start() == start_va.into()
-                {
-                    let old_end = area.vpn_range.get_end();
-                    area.unmap(&mut self.page_table);
-                    self.areas.remove(index);
-                    start_va = old_end.into();
-                } else if area.vpn_range.get_start() < start_va.into()
-                    && area.vpn_range.get_end() == end_va.into()
-                {
-                    area.shrink_to(&mut self.page_table, start_va.into());
-                    break;
-                } else if area.vpn_range.get_start() == start_va.into()
-                    && area.vpn_range.get_end() > end_va.into()
-                {
-                    for vpn in VPNRange::new(start_va.into(), end_va.into()) {
-                        area.unmap_one(&mut self.page_table, vpn);
-                    }
-                    area.vpn_range = VPNRange::new(end_va.into(), area.vpn_range.get_end());
-                    break;
-                } else {
-                    // split the area
-                    for vpn in VPNRange::new(start_va.into(), end_va.into()) {
-                        area.unmap_one(&mut self.page_table, vpn);
-                    }
-                    let split_area = area.split(end_va.into(), start_va.into());
-                    self.areas.push(split_area);
-                    break;
-                }
-            }
-        }
-    }
+         if port & 0b0000_0001 != 0 {
+             flags |= PTEFlags::R;
+         }
+
+         if port & 0b0000_0010 != 0 {
+             flags |= PTEFlags::W;
+         }
+
+         if port & 0b0000_0100 != 0 {
+             flags |= PTEFlags::X;
+         }
+
+         flags |= PTEFlags::U;
+         flags |= PTEFlags::V;
+
+         while vpn != end_vpn {
+             if let Some(pte) = self.page_table.translate(vpn) {
+                 debug!("find vpn {:?}, pte flag = {:?}", vpn, pte.flags());
+                 if pte.is_valid() {
+                     debug!("Already mapped on vpn {:?}", vpn);
+                     return -1;
+                 }
+             }
+
+             if let Some(frame) = frame_alloc() {
+                 let ppn = frame.ppn;
+                 self.page_table.map(vpn, ppn, flags);
+                 self.mmap_frames.insert(vpn, frame);
+                 debug!("mmap_frames: {:?}, flag: {:?}", self.mmap_frames, flags);
+             }
+             else {
+                 return -1;
+             }
+
+             vpn.step();
+         }
+
+         0
+
+     }
+
+    /// munmap
+    pub fn munmap(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> isize {
+         let mut vpn = start_vpn;
+         while vpn != end_vpn {
+             if let Some(pte) = self.page_table.translate(vpn) {
+                 if !pte.is_valid() {
+                     debug!("Unmapping no vpn.");
+                     return -1;
+                 }
+             }
+             else {
+                 return -1;
+             }
+             self.page_table.unmap(vpn);
+             self.mmap_frames.remove(&vpn);
+             vpn.step();
+         }
+
+         0
+     }
+
+
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -474,19 +490,7 @@ impl MapArea {
         }
     }
 
-    /// split the area
-    #[allow(unused)]
-    pub fn split(&mut self, split_vpn: VirtPageNum, new_end: VirtPageNum) -> Self {
-        let new_area = Self {
-            vpn_range: VPNRange::new(split_vpn, self.vpn_range.get_end()),
-            data_frames: self.data_frames.split_off(&split_vpn).into_iter().collect(),
-            map_type: self.map_type,
-            map_perm: self.map_perm,
-        };
-        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
-        new_area
     }
-}
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
@@ -506,21 +510,6 @@ bitflags! {
         const X = 1 << 3;
         ///Accessible in U mode
         const U = 1 << 4;
-    }
-}
-impl From<usize> for MapPermission {
-    fn from(perm: usize) -> Self {
-        let mut map_perm = MapPermission::empty();
-        if perm & 1 != 0 {
-            map_perm |= MapPermission::R;
-        }
-        if perm & 2 != 0 {
-            map_perm |= MapPermission::W;
-        }
-        if perm & 4 != 0 {
-            map_perm |= MapPermission::X;
-        }
-        map_perm
     }
 }
 

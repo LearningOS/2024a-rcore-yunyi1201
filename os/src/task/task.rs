@@ -1,14 +1,11 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::MAX_SYSCALL_NUM;
-use crate::config::TRAP_CONTEXT_BASE;
-use crate::fs::Stat;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::config::{TRAP_CONTEXT_BASE, MAX_SYSCALL_NUM};
+use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
-use crate::syscall::TaskInfo;
-use crate::timer::get_time_ms;
+use crate::task::current_task;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -50,25 +47,11 @@ pub struct TaskControlBlockInner {
     /// where the application address space is lower than base_size
     pub base_size: usize,
 
-    /// Record the number of times a syscall is called
-    pub syscall_times: [u32; MAX_SYSCALL_NUM],
-
-    /// time of first scheduled
-    pub first_scheduled: Option<usize>,
-
     /// Save task context
     pub task_cx: TaskContext,
 
     /// Maintain the execution status of the current process
     pub task_status: TaskStatus,
-
-    /// task priority
-    /// default is 16
-    pub prio: usize,
-
-    /// stride scheduling
-    /// default is 0
-    pub stride: usize,
 
     /// Application address space
     pub memory_set: MemorySet,
@@ -89,6 +72,18 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Stride
+    pub stride: u32,
+    
+    /// Priority
+    pub priority: u8,
+
+    /// Syscall times
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
+    /// Start time
+    pub start_time: usize
 }
 
 impl TaskControlBlockInner {
@@ -137,10 +132,6 @@ impl TaskControlBlock {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
                     base_size: user_sp,
-                    syscall_times: [0; MAX_SYSCALL_NUM],
-                    prio: 16,
-                    stride: 0,
-                    first_scheduled: None,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
                     memory_set,
@@ -157,6 +148,10 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    stride: 0,
+                    priority: 16,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    start_time: 0,
                 })
             },
         };
@@ -227,13 +222,8 @@ impl TaskControlBlock {
             kernel_stack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
-                    syscall_times: [0; MAX_SYSCALL_NUM],
-                    first_scheduled: None,
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
-                    // inherit parent's prio and stride
-                    prio: parent_inner.prio,
-                    stride: parent_inner.stride,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
                     memory_set,
@@ -243,6 +233,10 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    stride: 0,
+                    priority: 16,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    start_time: 0,
                 })
             },
         });
@@ -258,60 +252,9 @@ impl TaskControlBlock {
         // ---- release parent PCB
     }
 
-    /// Record the number of times a syscall is called
-    pub fn record_syscall(&self, syscall_number: usize) {
-        let mut inner = self.inner_exclusive_access();
-        inner.syscall_times[syscall_number] += 1;
-    }
-
-    /// Get the task information
-    pub fn get_task_info(&self, info: &mut TaskInfo) {
-        let inner = self.inner_exclusive_access();
-        *info = TaskInfo {
-            status: TaskStatus::Running,
-            syscall_times: inner.syscall_times,
-            time: get_time_ms() - inner.first_scheduled.unwrap(),
-        }
-    }
-
-    ///
-    pub fn add_child(&self, child: Arc<TaskControlBlock>) {
-        let mut inner = self.inner_exclusive_access();
-        inner.children.push(child);
-    }
-
-    /// check virtual page is maped in current task
-    pub fn is_mapped(&self, va: crate::mm::VirtAddr) -> bool {
-        let inner = self.inner.exclusive_access();
-
-        inner.memory_set.is_mapped(va.into())
-    }
-
-    /// map area structure, controls a contiguous piece of virtual memory
-    pub fn map_area(&self, start: usize, end: usize, permission: usize) {
-        let mut inner = self.inner.exclusive_access();
-        inner.memory_set.insert_framed_area(
-            start.into(),
-            end.into(),
-            MapPermission::from(permission) | MapPermission::U,
-        );
-    }
-
-    /// unmap area structure, controls a contiguous piece of virtual memory
-    pub fn unmap_area(&self, start: usize, end: usize) {
-        let mut inner = self.inner.exclusive_access();
-        inner.memory_set.unmap_area(start, end);
-    }
-
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
-    }
-
-    /// set current task's priority
-    pub fn set_priority(&self, prio: usize) {
-        let mut inner = self.inner_exclusive_access();
-        inner.prio = prio;
     }
 
     /// change the location of the program break. return None if failed.
@@ -339,15 +282,14 @@ impl TaskControlBlock {
             None
         }
     }
-
-    /// get the sepciifc file stat in fd_table
-    pub fn get_file_stat(&self, fd: usize) -> Option<Stat> {
-        let inner = self.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return None;
-        }
-
-        Some(inner.fd_table[fd].clone().unwrap().stat())
+    
+    /// spawn
+    pub fn spawn(&self, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let current_task=current_task().unwrap();
+        let new_task = Arc::new(TaskControlBlock::new(&elf_data));
+        current_task.inner_exclusive_access().children.push(new_task.clone());
+        new_task.inner_exclusive_access().parent = Some(Arc::downgrade(&current_task));
+        new_task
     }
 }
 
